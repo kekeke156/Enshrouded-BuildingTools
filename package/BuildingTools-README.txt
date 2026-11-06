@@ -235,6 +235,9 @@ Changing keys and settings
   Low FPS? Profile=1 under [Debug] writes the frame rate and the time each
   part of the mod takes to BuildingTools.log every 10 seconds; attach the log
   to a report.
+  A click that builds or removes nothing? Trace=1 under [Debug] writes every
+  step of each click to BuildingTools.log (on a dedicated server, set it in the
+  server's ini too); attach the log to a report.
 
 Language
   The mod's texts follow the game's language (Settings > Gameplay > Language, or

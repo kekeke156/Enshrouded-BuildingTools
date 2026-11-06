@@ -21,7 +21,7 @@ using core::Aabb;
 using core::I3;
 
 #define MOD_NAME    "Building Tools"
-#define MOD_VERSION "0.31.2"
+#define MOD_VERSION "0.31.3"
 
 // -------------------------------------------------------------- freestanding
 extern "C" {
@@ -84,6 +84,13 @@ static void log_line(Buf& b) {
     LeaveCriticalSection(&g_logLock);
 }
 #define LOG(expr) do { Buf _b; _b expr; log_line(_b); } while (0)
+// ---- click trace ([Debug] Trace=1): every step of a build or remove click in the log.
+// Each trace point writes at most kTraceMax lines, so code that runs every frame cannot
+// flood the log.
+static bool g_trace = false;
+static const LONG kTraceMax = 50;
+#define TRACE(expr) do { if (g_trace) { static volatile LONG _tn = 0; LONG _k = InterlockedIncrement(&_tn); \
+    if (_k <= kTraceMax) { Buf _b; _b.str("trace: "); _b expr; if (_k == kTraceMax) _b.str("  [last line of this trace point]"); log_line(_b); } } } while (0)
 
 // ---- frame-time measurement ([Debug] Profile=1)
 // Each hook adds its time (QueryPerformanceCounter) to a slot; the "game:" slots time
@@ -165,6 +172,7 @@ struct Config {
     int sound        = 1;
     int log          = 1;
     int profile      = 0;      // every 10 s the frame time and the mod's share of it in the log
+    int trace        = 0;      // every step of build / remove clicks in the log
     int corners      = 2;      // area corners: 2 = opposite corners of a box, 3 = base + height
     int exact        = 0;      // 1 = exact mode: one click, then the sizes in a window (corners stays 2)
     int exactRef = 1, exactW = 3, exactD = 3, exactH = 2;   // the last sizes entered: shapes past the clicked one
@@ -317,7 +325,8 @@ static void write_full_ini(const Config& c) {
      .t("; Text language: auto = as the game, or en, de, fr, it, ja, ko, pl, pt-BR, ru, es, th, tr,\r\n")
      .t(";     uk, zh-CN, zh-TW (files in the BuildingTools-Languages folder)\r\nLanguage=").t(c.language).t("\r\n")
      .t("\r\n[Debug]\r\nLog=").i(c.log).t("\r\n")
-     .t("; 1 = every 10 s the log gets the frame rate and the time each part of the mod takes\r\nProfile=").i(c.profile).t("\r\n");
+     .t("; 1 = every 10 s the log gets the frame rate and the time each part of the mod takes\r\nProfile=").i(c.profile).t("\r\n")
+     .t("; 1 = every step of build and remove clicks in the log (to find out why a click does nothing)\r\nTrace=").i(c.trace).t("\r\n");
     wchar_t p[MAX_PATH];
     lstrcpyW(p, g_dir); lstrcatW(p, L"BuildingTools.ini");
     HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -334,6 +343,8 @@ static void load_config() {
     g_cfg.log          = ini_int(L"Debug", L"Log", 1);
     g_cfg.profile      = ini_int(L"Debug", L"Profile", 0) != 0;
     g_prof             = g_cfg.profile && g_cfg.log;
+    g_cfg.trace        = ini_int(L"Debug", L"Trace", 0) != 0;
+    g_trace            = g_cfg.trace && g_cfg.log;
     {   int cn = ini_int(L"Area", L"Corners", 2);
         g_cfg.corners = cn == 3 ? 3 : 2; g_cfg.exact = cn == 1; }
     {   auto clampv = [](int v, int lo, int hi, int def) { return v < lo || v > hi ? def : v; };
@@ -425,7 +436,7 @@ static void load_config() {
         ini_int(L"Keys", L"RadialMenu", -1) == -1 || ini_int(L"Keys", L"HoldReplace", -1) == -1 ||
         ini_int(L"Area", L"DrawBoxBlocks", -1) == -1 || ini_int(L"Area", L"ExactWidth", -9999) == -9999 ||
         ini_int(L"Tools", L"AreaShapes", -1) == -1 || ini_int(L"Objects", L"Count", -1) == -1 ||
-        ini_int(L"Debug", L"Profile", -1) == -1)
+        ini_int(L"Debug", L"Profile", -1) == -1 || ini_int(L"Debug", L"Trace", -1) == -1)
         write_full_ini(g_cfg);
 }
 
@@ -1796,10 +1807,17 @@ static uint8_t* chest_list_hook(uint8_t* out, uint64_t* list, uint8_t* sysA, uin
     PROF(PF_CHEST);
     uint8_t* ret = (uint8_t*)__builtin_return_address(0);
     uint8_t* r = PROF_CALL(PF_CHEST_G, g_chestListOrig(out, list, sysA, sysB, pos, player));
+    if (g_trace && !is_client_sys(sysA ? sysA : sysB))   // the server world's calls (a client's UI calls all the time)
+        TRACE(.str("chest list (ChestList) from rva ").x((uint64_t)(ret - 5 - g_base)).str(": status ").i(out ? out[0] : -1)
+            .str(", chests ").u(list ? list[1] : 0).str(" + ").u(list ? list[3] : 0).str(", player ").u(player)
+            .str(ret == g_depositRet ? " (loot deposit)" : "").str(", thread ").u(GetCurrentThreadId()));
     // cheap tests first: the UI asks thousands of times per second
     if (!global_chests_on() || !out || !list || ret == g_depositRet) return r;
     uint8_t st = out[0];
-    if (st != 0 && st != 0x1f) return r;              // 0 = found, 0x1f = not in a base
+    if (st != 0 && st != 0x1f) {                      // 0 = found, 0x1f = not in a base
+        if (!is_client_sys(sysA ? sysA : sysB)) TRACE(.str("  chest list: status ").i(st).str(", left as the game made it"));
+        return r;
+    }
     uint8_t* sys = sysA ? sysA : sysB;
     if (!sys) return r;
     if (is_client_sys(sys)) {
@@ -1814,12 +1832,17 @@ static uint8_t* chest_list_hook(uint8_t* out, uint64_t* list, uint8_t* sysA, uin
         return r;
     }
     ChestTls* t = chest_tls(g_depositRet != nullptr);
-    if (!t || (!g_depositRet && !t->building)) return r;
+    if (!t || (!g_depositRet && !t->building)) {
+        TRACE(.str("  chest list: left as the game made it (").str(t ? "not a building payment)" : "no thread state)"));
+        return r;
+    }
     int nb = base_count(sys), cur = -1;
     if (st == 0 && list[1])
         for (int b = 0; b < nb; b++)
             if (*(uint64_t*)base_rec(sys, b) == list[0]) { cur = b; break; }
     int n = collect_chests(sys, cur, t->buf, kMaxChests);
+    TRACE(.str("  chest list: base ").i(cur).str(" of ").i(nb).str(", collected ").i(n).str(" chests")
+        .str(n > 0 ? " -> list replaced" : " -> list left as it was"));
     static volatile LONG s_log = 0;
     if (InterlockedIncrement(&s_log) <= 3)
         LOG(.str("global chests: a payment takes from ").i(n).str(" chests in ").i(nb).str(" bases")
@@ -1835,10 +1858,20 @@ typedef uint32_t (*StockCountFn)(void* map, uint8_t* sys, uint32_t item, const f
 static StockCountFn g_stockCountOrig = nullptr;
 static uint32_t stock_count_hook(void* map, uint8_t* sys, uint32_t item, const float* pos) {
     PROF(PF_SCOUNT);
-    // a system that is not a known client world's is the server's; until the client
-    // world has shown up nothing is changed
-    if (!global_chests_on() || !sys || !g_clientChests[0] || is_client_sys(sys))
-        return g_stockCountOrig(map, sys, item, pos);
+    // A system that is not a known client world's is the server's. In a game with a
+    // client world, nothing is changed until that world has shown up; a dedicated server
+    // has none, so there every call is the server's.
+    if (!global_chests_on() || !sys || (!g_dedicated && !g_clientChests[0]) || is_client_sys(sys)) {
+        uint32_t r = g_stockCountOrig(map, sys, item, pos);
+        static volatile LONG s_last = -1;
+        if (g_dedicated && InterlockedExchange(&s_last, (LONG)r) != (LONG)r)
+            TRACE(.str("stock count (StockCount) on the server: item ").u(item).str(" -> ").u(r).str(" (game's own)"));
+        return r;
+    }
+    {   static volatile LONG s_traced = 0;
+        if (!InterlockedExchange(&s_traced, 1))
+            TRACE(.str("stock count (StockCount) on the server: item ").u(item).str(" -> 65535 (plenty: the payment decides)"));
+    }
     return 0xffff;                                    // "plenty": the payment decides
 }
 
@@ -1861,7 +1894,12 @@ static uint8_t pay_hook(uint8_t* mode, CostList* list, uint8_t consume) {
     uint8_t* ret = (uint8_t*)__builtin_return_address(0);
     if (ret && ret == g_creativeSites[3]) g_undoRanTick = GetTickCount() | 1;
     ChestScope scope(global_chests_on() && creative_site(ret));
-    return pay_body(mode, list, consume, ret);
+    const uint64_t n = list && readable(list, sizeof(CostList)) ? list->count : 0;
+    uint8_t r = pay_body(mode, list, consume, ret);
+    TRACE(.str("payment (PayCost) from rva ").x((uint64_t)(ret - 5 - g_base)).str(": ").str(consume ? "charge" : "refund")
+        .str(" of ").u(n).str(" cost entries, mode ").i(mode && readable(mode, 1) ? mode[0] : -1).str(" -> result ").i(r)
+        .str(", thread ").u(GetCurrentThreadId()));
+    return r;
 }
 static uint8_t pay_body(uint8_t* mode, CostList* list, uint8_t consume, uint8_t* ret) {
     if (creative_on() && creative_site(ret)) {
@@ -1968,6 +2006,11 @@ static MissingFn g_missingOrig = nullptr;
 static uint8_t missing_hook(void* cursor, uint8_t* sel, float scale) {
     PROF(PF_MISSING);
     uint8_t r = PROF_CALL(PF_MISSING_G, g_missingOrig(cursor, sel, scale));
+    {   static volatile LONG s_last = -1;
+        if (InterlockedExchange(&s_last, r) != r)
+            TRACE(.str("material check (preview / server cursor): ").str(r ? "missing materials" : "enough")
+                .str(", thread ").u(GetCurrentThreadId()));
+    }
     if (r && creative_on() && sel && readable(sel + 0x60, 8)) {
         uint8_t* bp = *(uint8_t**)(sel + 0x60);
         if (bp && readable(bp + 0x458, 0x20) &&
@@ -2442,7 +2485,14 @@ static bool shrink_to_affordable(uint8_t* trans, CostList* list) {
 static uint8_t place_commit_hook(void* ctx, Commit* c, uint32_t shape) {
     bool mine = g_pend.n > 0 && g_pend.ctx == ctx && g_pend.tid == GetCurrentThreadId() &&
                 GetTickCount() - g_pend.tick < 3000;
-    if (!mine) return g_placeCommitOrig(ctx, c, shape);
+    if (!mine) {
+        uint8_t r = g_placeCommitOrig(ctx, c, shape);
+        TRACE(.str("place commit (PlaceCommit, game's own): shape ").u(shape).str(" at ").f(c ? c->pos[0] : 0, 2).c(' ')
+            .f(c ? c->pos[1] : 0, 2).c(' ').f(c ? c->pos[2] : 0, 2).str(", player ").u(c ? c->player : 0)
+            .str(" -> result ").i(r).str(", thread ").u(GetCurrentThreadId()));
+        return r;
+    }
+    TRACE(.str("place commit (PlaceCommit): the mod's ").i(g_pend.n).str(" queued shapes"));
     Pending pd = g_pend;
     g_pend.n = 0;
     uint8_t any = 0;
@@ -3195,10 +3245,21 @@ static uint8_t connected_remove(CostList* list, void* ctx, void* state, Aabb* bx
 
 static uint8_t remove_hook_body(void* list, void* ctx, void* state, void* box, void* xfp, void* filter, uint8_t check);
 static uint8_t remove_hook(void* list, void* ctx, void* state, void* box, void* xfp, void* filter, uint8_t check) {
-    if (!g_dedicated || g_ownRemoveTid == GetCurrentThreadId() || !is_server_ctx(ctx))
-        return remove_hook_body(list, ctx, state, box, xfp, filter, check);
+    const bool own = g_ownRemoveTid == GetCurrentThreadId();
+    auto trace = [&](uint8_t r) {
+        if (!own) TRACE(.str("remove dry run (RemoveShape): result ").i(r).str(", check ").i(check)
+            .str(", server ctx ").i(is_server_ctx(ctx)).str(", mode ").str(g_mode == MODE_AREA ? "area" : "prefab")
+            .str(", thread ").u(GetCurrentThreadId()));
+    };
+    if (!g_dedicated || own || !is_server_ctx(ctx)) {
+        uint8_t r = remove_hook_body(list, ctx, state, box, xfp, filter, check); trace(r); return r;
+    }
     NetScope ns(NetScope::ctx_input(ctx));
-    return remove_hook_body(list, ctx, state, box, xfp, filter, check);
+    TRACE(.str("remove click on the server: player ").x((uint64_t)(uintptr_t)NetScope::ctx_input(ctx))
+        .str(", settings ").str(ns.p ? "on" : "none or off (vanilla)"));
+    uint8_t r = remove_hook_body(list, ctx, state, box, xfp, filter, check);
+    trace(r);
+    return r;
 }
 static uint8_t remove_hook_body(void* list, void* ctx, void* state, void* box, void* xfp, void* filter, uint8_t check) {
     piece_target_restore();
@@ -3310,7 +3371,12 @@ static uint8_t remove_hook_body(void* list, void* ctx, void* state, void* box, v
 
 static uint8_t remove_commit_hook(void* ctx, Commit* c, uint32_t shape) {
     bool mine = g_rpend.ctx == ctx && g_rpend.tid == GetCurrentThreadId() && GetTickCount() - g_rpend.tick < 3000;
-    if (!mine) return g_removeCommitOrig(ctx, c, shape);
+    if (!mine) {
+        uint8_t r = g_removeCommitOrig(ctx, c, shape);
+        TRACE(.str("remove commit (RemoveCommit, game's own): shape ").u(shape).str(" -> result ").i(r)
+            .str(", thread ").u(GetCurrentThreadId()));
+        return r;
+    }
     RemovePending rp = g_rpend;
     g_rpend.ctx = nullptr;
     if (rp.suppress) { LOG(.str("  corner click: dismantle commit skipped")); return 0; }
@@ -3335,16 +3401,31 @@ static uint8_t remove_commit_hook(void* ctx, Commit* c, uint32_t shape) {
 
 static uint8_t place_hook_body(CostList* list, void* ctx, void* state, void* pdata, CursorXf* xf);
 static uint8_t place_hook(CostList* list, void* ctx, void* state, void* pdata, CursorXf* xf) {
-    if (!g_dedicated) return place_hook_body(list, ctx, state, pdata, xf);
+    const uint64_t n0 = list && readable(list, sizeof(CostList)) ? list->count : 0;
+    auto trace = [&](uint8_t r, const char* who) {
+        TRACE(.str("place dry run (PlaceShape) ").str(who).str(": result ").i(r).str(", shape ").u(state ? *(uint32_t*)state : 0)
+            .str(", cost entries ").u(n0).str(" -> ").u(list && readable(list, sizeof(CostList)) ? list->count : 0)
+            .str(", mode ").str(g_mode == MODE_AREA ? "area" : "prefab").str(", replace ").i(g_replace)
+            .str(", pos ").f(xf ? (double)xf->pos[0] * kInv : 0, 2).c(' ').f(xf ? (double)xf->pos[1] * kInv : 0, 2)
+            .c(' ').f(xf ? (double)xf->pos[2] * kInv : 0, 2)
+            .str(", thread ").u(GetCurrentThreadId()));
+    };
+    if (!g_dedicated) { uint8_t r = place_hook_body(list, ctx, state, pdata, xf); trace(r, ""); return r; }
     // ctx+0x58 is still empty here (filled after PlaceShape returns)
     uint8_t* input = nullptr;
     if (g_cursorLayoutOk) {
         uint8_t** slot = (uint8_t**)((uint8_t*)xf - 0x118);
         if (readable(slot, 8)) input = *slot;
     }
+    const bool fromCtx = !input;
     if (!input) input = NetScope::ctx_input(ctx);
     NetScope ns(input);
-    return place_hook_body(list, ctx, state, pdata, xf);
+    {   uint32_t s = 0; const bool ok = net_state_of(input, &s);
+        TRACE(.str("place click on the server: player ").x((uint64_t)(uintptr_t)input).str(fromCtx ? " (from ctx+0x58)" : " (from the cursor frame)")
+            .str(", settings ").str(ok ? (s & core::NET_ON ? "on" : "off") : "none (vanilla)").str(", state ").x(s)); }
+    uint8_t r = place_hook_body(list, ctx, state, pdata, xf);
+    trace(r, "on the server");
+    return r;
 }
 static uint8_t place_hook_body(CostList* list, void* ctx, void* state, void* pdata, CursorXf* xf) {
     const bool replace = g_replace != 0 && item_kind(state) != ITEM_PIECE;     // pieces place as in the game
@@ -6066,9 +6147,15 @@ static DWORD WINAPI init_thread(void*) {
         uint8_t* cnt = find_unique("StockCount", SIG_STOCK_COUNT);
         uint8_t* dep = find_unique("DepositChests", SIG_DEPOSIT_CHESTS);
         auto rel = [](uint8_t* at) -> uint8_t* { return at && at[0] == 0xE8 ? at + 5 + *(int32_t*)(at + 1) : nullptr; };
-        // the missing-materials check's two stock counts
+        // the missing-materials check's two stock counts: the calls to StockCount in its
+        // first 0x400 bytes (client +0x137 / +0x2d7, dedicated server +0x140 / +0x2fb)
         uint8_t* mf = (uint8_t*)g_missingOrig;
-        uint8_t* cntSites[2] = { mf ? mf + 0x137 : nullptr, mf ? mf + 0x2d7 : nullptr };
+        uint8_t* cntSites[2] = { nullptr, nullptr };
+        int nCntSites = 0;
+        if (mf && cnt && mf >= g_textBase && mf + 0x400 + 5 <= g_textBase + g_textSize)
+            for (int i = 0; i < 0x400; i++)
+                if (rel(mf + i) == cnt) { if (nCntSites < 2) cntSites[nCntSites] = mf + i; nCntSites++; }
+        if (nCntSites != 2) cntSites[0] = cntSites[1] = nullptr;
         // ChestList and ClientStock use BaseAt and read a base record as {chest ids, count}
         // at sys + 0x30 + i * 0x130; BaseAt reads the base boxes and sub-boxes
         bool layout = cl && cs && ba && cnt && rel(cl + 0x74) == ba && rel(cs + 0xef) == ba &&
@@ -6240,6 +6327,7 @@ static DWORD WINAPI init_thread(void*) {
     g_active = 1;
     LOG(.str("ready. keys: area=").i(g_cfg.keyStructure).str(" replace=").i(g_cfg.keyReplace).str(" style=").i(g_cfg.keyStyle)
         .str(" cancel=").i(g_cfg.keyCancel).str(" maxShapes=").i(g_cfg.maxShapes));
+    if (g_trace) LOG(.str("click trace on ([Debug] Trace=1): up to ").i(kTraceMax).str(" lines per trace point"));
     { Buf b; b.fmt(T(g_cfg.creative ? S_READY_CREATIVE : S_READY), MOD_VERSION); flash(b.z()); }
     return 0;
 }

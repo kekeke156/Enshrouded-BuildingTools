@@ -3,6 +3,16 @@
 Each `## x.y.z` section is used as the release notes on GitHub and as the file
 changelog on Nexus Mods, so keep it short and written for players.
 
+## 0.31.3
+
+- **Magic chests of all bases on dedicated servers.** The server's log said "not available
+  (game code differs)", so `GlobalMagicChests=1` in the server's `BuildingTools.ini` did
+  nothing. The mod now also finds the server's version of the game code, and the
+  server no longer refuses a block whose material is only in another base's chests
+  (blue preview, nothing placed).
+- **Click trace for bug reports**: `Trace=1` under `[Debug]` in `BuildingTools.ini` writes
+  every step of a build or remove click to `BuildingTools.log` (on a dedicated server too).
+
 ## 0.31.2
 
 - **Works with GreeneyeDS mods** (Find - Base Storage Search, The Worst Map Mod). They hook
